@@ -3,7 +3,8 @@
     python -m gap_analyzer.app [--port 8050] [--host 127.0.0.1]
 
 Panel A: group overview (task, initial state). Panel B: metric over time for the 8 rollouts of a
-group. Panel C: rollout viewer (real / imagined / error maps) with a synced metric plot.
+group (plus the open-loop dream + replay rollouts of that group, if a replay run exists).
+Panel C: rollout viewer (real / imagined / error maps) with a synced metric plot.
 Viewer frames are composed on the server from in-memory buffers and served as JPEG at
 /frame/<metric>/<task>/<state>/<rollout>/<i>.jpg.
 """
@@ -28,8 +29,11 @@ from .compute import cache_paths
 from .metrics import REGISTRY
 
 GREEN, RED, GREY = "#1a9850", "#d73027", "#b0b4ba"
+DREAM = "#5b2a86"  # open-loop dream label colour
+ROW_BG = {"mixed": "#d9f0d3", "success": "#dcf1d8", "failure": "#f9dcd8",
+          "success_sel": "#9fd59a", "failure_sel": "#f0a59b", "selected": "#dbe7ff"}
 
-INDEX = data.build_index()  # raises for held-out / non-allowlisted runs
+INDEX = data.build_full_index()  # raises for held-out / non-allowlisted runs
 STORE = data.GroupStore(INDEX)
 FRAME_TIMES = deque(maxlen=200)  # server time per /frame request (ms), excluding first loads
 
@@ -47,6 +51,11 @@ def _load_metric(metric: str, mtime: float):
     frames = pd.read_parquet(p["frames"])
     eps = pd.read_parquet(p["episodes"])
     scale = json.loads(p["scale"].read_text())
+    for df in (frames, eps):  # caches written before replay support are closed loop only
+        if "replay" not in df:
+            df["replay"] = False
+    if "success_final" not in eps:
+        eps["success_final"] = pd.NA
     return frames, eps, scale
 
 
@@ -59,8 +68,10 @@ def group_table(metric: str, tasks) -> list[dict]:
     lib = scale["lower_is_better"]
     if tasks:
         eps = eps[eps.task.isin(tasks)]
+    lo, hi = config.MIXED_OUTCOME
     rows = []
-    for (task, state), g in eps.groupby(["task", "state"], sort=True):
+    for (task, state), ga in eps.groupby(["task", "state"], sort=True):
+        g, gr = ga[~ga.replay], ga[ga.replay]  # stats over closed-loop rollouts; replay success separately
         s, f = g[g.success]["mean"].to_numpy(), g[~g.success]["mean"].to_numpy()
         if len(s) and len(f):
             better = (s[:, None] < f[None, :]) if lib else (s[:, None] > f[None, :])
@@ -68,10 +79,35 @@ def group_table(metric: str, tasks) -> list[dict]:
             rank = float((better + 0.5 * ties).mean())
         else:
             rank = None
+        rate = g.success.mean() if len(g) else 0.0
         rows.append({"id": f"{task}|{state}", "task": task, "state": int(state),
-                     "success": f"{int(g.success.sum())}/{len(g)}", "mean": g["mean"].mean(),
+                     "success": f"{int(g.success.sum())}/{len(g)}", "mixed": int(lo <= rate <= hi),
+                     "replay": f"{int(gr.success.sum())}/{len(gr)}" if len(gr) else "",
+                     "mean": g["mean"].mean(),
                      "final": g["final"].mean(), "rank": rank, "spread": g["mean"].std()})
     return rows
+
+
+def groups_style(selected_id: str | None = None) -> list[dict]:
+    """Panel A: mixed-outcome groups green, the open group blue."""
+    styles = [{"if": {"filter_query": "{mixed} = 1"}, "backgroundColor": ROW_BG["mixed"]}]
+    if selected_id:
+        styles.append({"if": {"filter_query": f'{{id}} = "{selected_id}"'}, "backgroundColor": ROW_BG["selected"],
+                       "fontWeight": 600})
+    return styles
+
+
+def rollouts_style(selected: int | None = None) -> list[dict]:
+    """Panel C list: success rows green, failure rows red, the shown rollout darker and bold;
+    open-loop dream rows are labelled in the loop column."""
+    styles = [{"if": {"filter_query": "{success} = 1"}, "backgroundColor": ROW_BG["success"]},
+              {"if": {"filter_query": "{success} = 0"}, "backgroundColor": ROW_BG["failure"]},
+              {"if": {"filter_query": "{replay} = 1", "column_id": "loop"}, "color": DREAM, "fontWeight": 700}]
+    if selected is not None:
+        for ok, bg in ((1, ROW_BG["success_sel"]), (0, ROW_BG["failure_sel"])):
+            styles.append({"if": {"filter_query": f"{{id}} = {int(selected)} && {{success}} = {ok}"},
+                           "backgroundColor": bg, "fontWeight": 700})
+    return styles
 
 
 # ---------------------------------------------------------------- figures
@@ -100,11 +136,14 @@ def group_figure(metric: str, task: str, state: int, xmode: str, selected, cutof
         e = ep.loc[r]
         color = GREEN if e.success else RED
         sel = selected is not None and int(selected) == int(r)
+        label = data.rollout_label(r, e.replay)
+        kind = "open-loop dream, replay " if e.replay else ""
         fig.add_trace(go.Scattergl(
-            x=g[xcol], y=g.value_mean, mode="lines", name=f"r{r} {'✓' if e.success else '✗'}",
-            line=dict(color=color, width=3.5 if sel else 1.6), opacity=1 if sel or selected is None else 0.55,
+            x=g[xcol], y=g.value_mean, mode="lines", name=f"{label} {'✓' if e.success else '✗'}",
+            line=dict(color=color, width=3.5 if sel else 1.6, dash="dot" if e.replay else "solid"),
+            opacity=1 if sel or selected is None else 0.55,
             customdata=np.full(len(g), r), legendgroup=str(r),
-            hovertemplate=f"rollout {r} ({'success' if e.success else 'failure'})<br>"
+            hovertemplate=f"{label} ({kind}{'success' if e.success else 'failure'})<br>"
                           f"{'t' if norm else 'step'} %{{x}}<br>{metric} %{{y:.4g}}<extra></extra>"))
         for col, symbol, label in (("success_step", "star", "success"), ("grasp_step", "diamond", "grasp")):
             st = e[col]
@@ -115,7 +154,8 @@ def group_figure(metric: str, task: str, state: int, xmode: str, selected, cutof
                         x=row[xcol], y=row.value_mean, mode="markers", legendgroup=str(r), showlegend=False,
                         marker=dict(symbol=symbol, size=11 if symbol == "star" else 8, color=color,
                                     line=dict(color="black", width=1)),
-                        customdata=[r], hovertemplate=f"rollout {r} {label} at step {int(st)}<extra></extra>"))
+                        customdata=[r], hovertemplate=f"{data.rollout_label(r, e.replay)} {label} at step "
+                                                      f"{int(st)}<extra></extra>"))
     shapes = []
     if not norm:
         b = fr.loc[fr.chunk.diff().fillna(0) != 0, "step"].unique()
@@ -154,8 +194,29 @@ def episode_figure(metric: str, task: str, state: int, rollout: int):
                       xaxis_title="env step", yaxis_title=metric, hovermode="x unified",
                       legend=dict(orientation="h", y=1.18, x=0, xanchor="left", font=dict(size=11)))
     info = {"base": f"/frame/{metric}/{task}/{state}/{rollout}", "n": int(len(fr)),
-            "steps": steps.tolist(), "chunks": fr.chunk.tolist(), "success": bool(e.success)}
+            "steps": steps.tolist(), "chunks": fr.chunk.tolist(), "success": bool(e.success),
+            "replay": bool(e.replay), "success_step": None if pd.isna(e.success_step) else int(e.success_step),
+            "success_final": None if pd.isna(e.success_final) else bool(e.success_final)}
     return fig, info
+
+
+def loop_badge(ro: dict | None, info: dict | None):
+    """Panel C banner: closed loop or open-loop dream, and what success means for it."""
+    if not ro or not info:
+        return "", "loop-badge"
+    r = ro["rollout"]
+    if not info["replay"]:
+        return f"{data.rollout_label(r, False)} · closed loop: the model sees the real observation at every query", \
+            "loop-badge closed"
+    twin = data.rollout_label(r - config.REPLAY_ROLLOUT_OFFSET, False)
+    if info["success"]:
+        held = {True: ", still successful at the end", False: ", not held to the end"}.get(info["success_final"], "")
+        outcome = f"replay success at step {info['success_step']}{held}"
+    else:
+        outcome = "replay failure"
+    return (f"{data.rollout_label(r, True)} · FULL IMAGINATION (open loop): the model saw the real observation "
+            f"only at query 0, then its own dream frames. The simulator executed the dreamed actions. "
+            f"Closed-loop twin: {twin} (chunk 0 identical). {outcome} (simulator, not dream).", "loop-badge dream")
 
 
 # ---------------------------------------------------------------- layout
@@ -172,15 +233,24 @@ def rollout_rows(metric: str, task: str, state: int, cutoff: int | None = None) 
         fr = fr[fr.step <= cutoff]
     stats = fr.groupby("rollout").value_mean.agg(["mean", "max", "size"])
     g = eps[(eps.task == task) & (eps.state == state)].sort_values("rollout")
-    return [{"id": int(r.rollout), "rollout": int(r.rollout), "success": int(r.success),
-             "outcome": "✓" if r.success else "✗", "steps": int(stats.loc[r.rollout, "size"]),
+    return [{"id": int(r.rollout), "rollout": data.rollout_label(r.rollout, r.replay), "success": int(r.success),
+             "replay": int(r.replay), "loop": "open (dream)" if r.replay else "closed",
+             "steps": int(stats.loc[r.rollout, "size"]),
              "mean": float(stats.loc[r.rollout, "mean"]), "max": float(stats.loc[r.rollout, "max"])}
             for r in g.itertuples()]
 
 
-def group_length(task: str, state: int) -> int:
-    g = INDEX[(INDEX.task == task) & (INDEX.state == state)]
-    return int(g.length.max())
+def group_length(metric: str, task: str, state: int) -> int:
+    eps = load_metric(metric)[1]
+    return int(eps[(eps.task == task) & (eps.state == state)].length.max())
+
+
+def stale_cache_hint(metrics_) -> str:
+    if not INDEX.replay.any():
+        return ""
+    stale = [m for m in metrics_ if not load_metric(m)[1].replay.any()]
+    return (f"A replay run was found but the cache of {', '.join(stale)} has no replay episodes: rerun "
+            f"python -m gap_analyzer.compute --metric <name> (it recomputes stale caches).") if stale else ""
 
 
 def _default_metric(metrics_):
@@ -198,6 +268,7 @@ def serve_layout():
     columns = [
         {"name": "task", "id": "task"}, {"name": "state", "id": "state", "type": "numeric"},
         {"name": "success", "id": "success"},
+        *([{"name": "replay success", "id": "replay"}] if INDEX.replay.any() else []),
         {"name": "mean", "id": "mean", "type": "numeric", "format": fmt},
         {"name": "final", "id": "final", "type": "numeric", "format": fmt},
         {"name": "within-group rank", "id": "rank", "type": "numeric", "format": fmt},
@@ -205,7 +276,7 @@ def serve_layout():
     ]
     return html.Div(className="page", children=[
         html.Div(className="header", children=[
-            html.H2(f"Gap Analyzer · {config.DEFAULT_RUN}"),
+            html.H2(f"Gap Analyzer · {' + '.join(sorted(INDEX.run.unique()))}"),
             html.Div(className="ctl", children=["metric", dcc.Dropdown(
                 id="metric", options=metrics_, value=_default_metric(metrics_), clearable=False,
                 style={"width": 200})]),
@@ -214,15 +285,21 @@ def serve_layout():
             html.Div(id="status", className="status"),
         ]),
         html.Div(className="hint", style={"marginBottom": 8}, children=(
-            "" if metrics_ else "No cached metrics. Run: python -m gap_analyzer.compute --metric pixel_mse")),
+            stale_cache_hint(metrics_) if metrics_ else
+            "No cached metrics. Run: python -m gap_analyzer.compute --metric pixel_mse")),
         html.Div(className="panel", children=[
             html.H3("A · Groups (task, initial state)"),
             html.Div(className="hint", children=(
-                "Click a row to open the group. within-group rank = fraction of (success, failure) pairs where the "
-                "success has the better episode-mean metric (empty if the group is all success or all failure). "
-                "spread = std of the 8 episode means.")),
+                f"Click a row to open the group. Green rows = mixed outcome (closed-loop success rate between "
+                f"{config.MIXED_OUTCOME[0]:.0%} and {config.MIXED_OUTCOME[1]:.0%}). success, mean, final, rank and "
+                "spread use the closed-loop rollouts only. within-group rank = fraction of (success, failure) pairs "
+                "where the success has the better episode-mean metric (empty if the group is all success or all "
+                "failure). spread = std of the 8 episode means." +
+                (" replay success = open-loop dream + replay rollouts whose simulator succeeded."
+                 if INDEX.replay.any() else ""))),
             dash_table.DataTable(
                 id="groups", columns=columns, data=[], sort_action="native", page_action="none",
+                style_data_conditional=groups_style(),
                 sort_by=[], style_table={"maxHeight": "340px", "overflowY": "auto"}, fixed_rows={"headers": True},
                 style_cell={"fontSize": 13, "padding": "3px 8px", "fontFamily": "system-ui", "minWidth": 80},
                 style_cell_conditional=[{"if": {"column_id": "task"}, "textAlign": "left", "minWidth": 200}],
@@ -250,18 +327,21 @@ def serve_layout():
             html.Div(className="hint", children=(
                 "green = success, red = failure. ★ success step, ◆ grasp (object lifted 3 cm). Dashed lines = chunk "
                 "boundaries (absolute mode only; in normalized time they differ per rollout). Click a line to view it. "
+                "Dotted lines (r0 dream, …) = open-loop dream + replay rollouts (full imagination after query 0), "
+                "green/red = replay success / failure. "
                 "The purple cursor (slider above, absolute steps only) sets up to which step avg / max in the "
                 "rollout list of panel C are computed.")),
         ]),
         html.Div(className="panel", children=[
-            html.H3("C · Rollout"),
+            html.Div(style={"display": "flex", "gap": 16, "alignItems": "center"}, children=[
+                html.H3("C · Rollout"), html.Div(id="loop-badge", className="loop-badge")]),
             html.Div(className="panel-c-top", children=[
                 html.Div(className="rollout-list", children=[
                     html.Div(id="rollouts-hint", className="hint"),
                     dash_table.DataTable(
                         id="rollouts", data=[], sort_action="native", sort_by=ROLLOUT_SORT_DEFAULT,
-                        columns=[{"name": "rollout", "id": "rollout", "type": "numeric"},
-                                 {"name": "", "id": "outcome"},
+                        columns=[{"name": "rollout", "id": "rollout"},
+                                 {"name": "loop", "id": "loop"},
                                  {"name": "steps", "id": "steps", "type": "numeric"},
                                  {"name": "avg", "id": "mean", "type": "numeric",
                                   "format": Format(precision=2, scheme=Scheme.fixed)},
@@ -269,14 +349,17 @@ def serve_layout():
                                   "format": Format(precision=2, scheme=Scheme.fixed)}],
                         style_cell={"fontSize": 13, "padding": "4px 8px", "fontFamily": "system-ui"},
                         style_header={"fontWeight": 600, "backgroundColor": "#f0f2f5"},
-                        style_cell_conditional=[{"if": {"column_id": "outcome"}, "textAlign": "center",
-                                                 "fontWeight": 700, "width": "24px"}]),
+                        style_cell_conditional=[{"if": {"column_id": c}, "textAlign": "left"}
+                                                for c in ("rollout", "loop")]),
+                    html.Div(className="hint", style={"marginTop": 4},
+                             children="green = success, red = failure (for dream rows: replay success)."),
                 ]),
                 html.Div(children=[
                     html.Div(className="col-labels", children=[html.Div(v) for v in config.VIEWS]),
                     html.Div(className="viewer-wrap", children=[
                         html.Div(className="row-labels",
-                                 children=[html.Div(html.Span(t)) for t in ("real", "imagined", "error map")]),
+                                 children=[html.Div(html.Span(t, id=f"row-label-{i}")) for i, t in
+                                           enumerate(("real", "imagined", "error map"))]),
                         html.Div(id="viewer"),
                         html.Div(className="cbar-col", children=[html.Div(className="cbar", children=[
                             html.Div(className="cbar-grad", style={"background": render.css_gradient()}),
@@ -353,8 +436,7 @@ def select_group(cell):
     if not cell or "row_id" not in cell:
         return no_update, no_update
     task, state = cell["row_id"].split("|")
-    style = [{"if": {"filter_query": f'{{id}} = "{cell["row_id"]}"'}, "backgroundColor": "#dbe7ff"}]
-    return {"task": task, "state": int(state)}, style
+    return {"task": task, "state": int(state)}, groups_style(cell["row_id"])
 
 
 @app.callback(Output("group-plot", "figure"), Output("group-info", "children"),
@@ -367,7 +449,7 @@ def update_group_plot(sel, metric, xmode, ro, cutoff):
     rollout = ro["rollout"] if ro and (ro["task"], ro["state"]) == (sel["task"], sel["state"]) else None
     STORE.open_group(sel["task"], sel["state"], metric)  # background preload of all 8 rollouts
     instr = INDEX[(INDEX.task == sel["task"]) & (INDEX.state == sel["state"])].instruction.iloc[0]
-    n = group_length(sel["task"], sel["state"])
+    n = group_length(metric, sel["task"], sel["state"])
     # a new group starts with the cursor at the end (= whole episodes); otherwise keep it
     cutoff = n if "sel-group.data" in ctx.triggered_prop_ids or not cutoff else min(int(cutoff), n)
     fig = group_figure(metric, sel["task"], sel["state"], xmode, rollout, cutoff)
@@ -388,14 +470,14 @@ def select_rollout(sel, metric, click, cell, cutoff, cutoff_max, current):
     trig = set(ctx.triggered_prop_ids)
     same_group = bool(current) and (current["task"], current["state"]) == (sel["task"], sel["state"])
     new_group = "sel-group.data" in trig or not same_group
-    n = group_length(sel["task"], sel["state"])
+    n = group_length(metric, sel["task"], sel["state"])
     # on a new group the cursor is reset to the end by update_group_plot; don't use the old group's value
     cut = n if new_group or not cutoff else min(int(cutoff), n)
     rows = rollout_rows(metric, sel["task"], sel["state"], cut)
     hint = (f"avg / max over steps 1–{cut}" + ("" if cut >= n else " (cursor in panel B)") +
             " · click a rollout · click a header to sort")
     if new_group:
-        best = min(rows, key=lambda r: r["mean"])["rollout"]
+        best = min(rows, key=lambda r: r["mean"])["id"]
         return rows, ROLLOUT_SORT_DEFAULT, {**key, "rollout": best}, hint
     selection = no_update
     if "group-plot.clickData" in trig and click:
@@ -409,23 +491,22 @@ def select_rollout(sel, metric, click, cell, cutoff, cutoff_max, current):
 
 
 @app.callback(Output("rollouts", "style_data_conditional"), Output("rollouts", "active_cell"),
-              Input("rollout", "data"))
+              Output("rollouts", "selected_cells"), Input("rollout", "data"))
 def highlight_rollout(ro):
-    styles = [{"if": {"filter_query": "{success} = 1", "column_id": "outcome"}, "color": GREEN},
-              {"if": {"filter_query": "{success} = 0", "column_id": "outcome"}, "color": RED}]
-    if ro:
-        styles.append({"if": {"filter_query": f"{{id}} = {ro['rollout']}"},
-                       "backgroundColor": "#dbe7ff", "fontWeight": 600})
-    return styles, None  # clear the active cell so clicking the same row again re-selects it
+    # clear the active / selected cell so clicking the same row again re-selects it and the
+    # table's own selection colour does not hide the success / failure colour
+    return rollouts_style(ro["rollout"] if ro else None), None, []
 
 
 @app.callback(Output("ep-plot", "figure"), Output("ep-info", "data"), Output("frame", "max"),
               Output("frame", "value"), Output("cbar-labels", "children"), Output("play", "data"),
+              Output("loop-badge", "children"), Output("loop-badge", "className"), Output("row-label-1", "children"),
               Input("rollout", "data"), Input("metric", "value"),
               State("frame", "value"), State("ep-info", "data"))
 def update_episode(ro, metric, frame, prev_info):
     if not ro or not metric:
-        return go.Figure(layout=dict(height=230, template="plotly_white")), None, 1, 0, [], {"playing": False}
+        return (go.Figure(layout=dict(height=230, template="plotly_white")), None, 1, 0, [], {"playing": False},
+                *loop_badge(None, None), "imagined")
     # load the clicked rollout first, ahead of the rest of the group
     task, state, rollout = ro["task"], ro["state"], ro["rollout"]
     threading.Thread(target=STORE.get, args=(task, state, rollout, metric), daemon=True).start()
@@ -437,7 +518,8 @@ def update_episode(ro, metric, frame, prev_info):
     same_episode = prev_info and prev_info["base"].split("/", 3)[3] == info["base"].split("/", 3)[3]
     frame = min(frame or 0, info["n"] - 1) if same_episode else 0  # keep the frame on a metric switch
     fig.layout.shapes[0].update(x0=info["steps"][frame], x1=info["steps"][frame])
-    return fig, info, info["n"] - 1, frame, labels, {"playing": False}
+    return (fig, info, info["n"] - 1, frame, labels, {"playing": False}, *loop_badge(ro, info),
+            "dream (open loop)" if info["replay"] else "imagined")
 
 
 @app.callback(Output("status", "children"), Input("status-tick", "n_intervals"))
@@ -503,7 +585,8 @@ app.clientside_callback(
         window.gapViewer.prefetch(ahead);
         window.gapViewer.moveMarker(info.steps[i]);
         return `frame ${i + 1}/${info.n} · step ${info.steps[i]} · chunk ${info.chunks[i]}` +
-               (info.success ? " · success" : " · failure");
+               (info.replay ? " · open-loop dream" + (info.success ? " · replay success" : " · replay failure")
+                            : (info.success ? " · success" : " · failure"));
     }
     """ % config.PREFETCH_FRAMES),
     Output("counter", "children"), Input("frame", "value"), Input("ep-info", "data"),
@@ -549,7 +632,7 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args(argv)
-    print(f"{len(INDEX)} episodes in {config.DEFAULT_RUN}, cached metrics: {cached_metrics()}")
+    print(f"{len(INDEX)} episodes in {', '.join(sorted(INDEX.run.unique()))}, cached metrics: {cached_metrics()}")
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 

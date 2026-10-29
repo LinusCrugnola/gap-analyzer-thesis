@@ -1,9 +1,12 @@
 """Paths, run allowlist and defaults.
 
-Only the dev run is allowed. The held-out run must never be loaded: any path that
-contains "heldout" is refused, and any run name not in ALLOWED_RUNS is refused.
+Only the dev run and open-loop replay runs of it are allowed. The held-out run must never be
+loaded: any path that contains "heldout" is refused, and any run name that is not in
+ALLOWED_RUNS and does not match REPLAY_RUN_PATTERN is refused. Replay episodes are only used
+if they have a closed-loop twin in the dev run (checked in data.build_index).
 """
 import os
+import re
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +16,11 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = Path(os.environ.get("GAP_ANALYZER_RUNS_ROOT", "/data/crugnola/sim/deva/output/runs"))
 ALLOWED_RUNS = ("20261027_1743_gap_dev_h16",)
 DEFAULT_RUN = ALLOWED_RUNS[0]
+# Open-loop "dream + replay" runs (open_loop = "replay"): rollout 0 of dev groups, with the model
+# fed its own predicted frames after query 0. The newest matching run under RUNS_ROOT is used;
+# GAP_ANALYZER_REPLAY_RUN picks one explicitly (it must match the pattern too).
+REPLAY_RUN_PATTERN = re.compile(r"^\d{8}_\d{4}_gap_replay_h16$")
+REPLAY_ROLLOUT_OFFSET = 100  # replay rollout r is shown as rollout id 100 + r, next to closed-loop r
 MODEL_DIR = "base"  # run_dir/<model>/<task>/epNNN_success_*_{frames,traj}.npz, *_meta.json
 
 CACHE_DIR = Path(os.environ.get("GAP_ANALYZER_CACHE", APP_ROOT / "cache"))
@@ -28,6 +36,7 @@ VIEW_SLICES = {
 }
 
 GROUP_SIZE = 8           # rollouts per (task, initial state)
+MIXED_OUTCOME = (0.3, 0.7)  # panel A: a group is "mixed" if its closed-loop success rate is in this range
 GRASP_LIFT_M = 0.03      # grasp event = first step the object is this far above its initial height
 
 # Viewer / preloading
@@ -57,8 +66,9 @@ def check_run_dir(run_dir) -> Path:
     for p in (raw, resolved):
         if "heldout" in str(p).lower():
             raise ForbiddenRunError(f"refusing held-out data: {p}")
-    if resolved.name not in ALLOWED_RUNS:
-        raise ForbiddenRunError(f"run {resolved.name!r} is not in the allowlist {ALLOWED_RUNS}")
+    if resolved.name not in ALLOWED_RUNS and not REPLAY_RUN_PATTERN.match(resolved.name):
+        raise ForbiddenRunError(f"run {resolved.name!r} is not in the allowlist {ALLOWED_RUNS} "
+                                f"and is not a replay run ({REPLAY_RUN_PATTERN.pattern})")
     if not resolved.is_dir():
         raise FileNotFoundError(resolved)
     return resolved
@@ -66,3 +76,15 @@ def check_run_dir(run_dir) -> Path:
 
 def run_dir(name: str = DEFAULT_RUN) -> Path:
     return check_run_dir(RUNS_ROOT / name)
+
+
+def replay_run_name() -> str | None:
+    """Name of the replay run to show next to the dev run, or None if there is none."""
+    name = os.environ.get("GAP_ANALYZER_REPLAY_RUN")
+    if name:
+        return name
+    if not RUNS_ROOT.is_dir():
+        return None
+    names = sorted(p.name for p in RUNS_ROOT.iterdir()
+                   if REPLAY_RUN_PATTERN.match(p.name) and "heldout" not in p.name.lower())
+    return names[-1] if names else None

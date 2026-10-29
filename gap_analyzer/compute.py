@@ -1,4 +1,4 @@
-"""Compute metrics over all dev-run episodes into the parquet cache.
+"""Compute metrics over all dev-run (and replay-run, if present) episodes into the parquet cache.
 
     python -m gap_analyzer.compute --metric pixel_mse [--metric pixel_l1 ...] [--force] [--workers 8]
     python -m gap_analyzer.compute --all
@@ -7,6 +7,7 @@ Outputs per metric (in config.CACHE_DIR):
     <metric>.parquet           one row per (episode, frame)
     <metric>_episodes.parquet  one row per episode: mean, final, success, events
     <metric>_scale.json        1st/99th percentile of error-map values (fixed colormap scale) + metric info
+A cache whose episodes differ from the index (e.g. a replay run appeared) is recomputed.
 Resumable: finished episodes are kept in cache/.parts/<metric>/ until all episodes are done.
 Error maps are never written; only a random sample of their values is kept for the scale.
 """
@@ -32,7 +33,7 @@ def cache_paths(metric: str) -> dict:
 
 
 def _part_name(row) -> str:
-    return f"{row['task']}_ep{int(row['episode']):03d}"
+    return f"{'replay_' if row['replay'] else ''}{row['task']}_ep{int(row['episode']):03d}"
 
 
 def _write_atomic(path, write):
@@ -46,6 +47,8 @@ def _process_episode(row: dict, metric_names: list[str]):
     ep = data.load_episode(row)
     with data.load_traj(row) as traj:
         grasp = events.grasp_step(traj)
+        # replay episodes run to the max length after success; did the success hold at the end?
+        success_final = bool(np.asarray(traj["task_success"])[-1]) if "task_success" in traj else None
     T = ep.n_frames
     for name in metric_names:
         m = metrics.get(name)
@@ -55,10 +58,12 @@ def _process_episode(row: dict, metric_names: list[str]):
             "episode": int(row["episode"]), "frame": np.arange(T, dtype=np.int32),
             "step": ep.steps.astype(np.int32), "t_norm": ep.steps / T, "chunk": ep.chunk_ids.astype(np.int32),
             **{f"value_view{v}": values[v] for v in range(values.shape[0])},
-            "value_mean": values.mean(0), "success": bool(row["success"]),
+            "value_mean": values.mean(0), "success": bool(row["success"]), "replay": bool(row["replay"]),
         })
         ep_row = {"task": row["task"], "state": int(row["state"]), "rollout": int(row["rollout"]),
-                  "episode": int(row["episode"]), "success": bool(row["success"]), "length": T,
+                  "episode": int(row["episode"]), "replay": bool(row["replay"]),
+                  "rollout_idx": int(row["rollout_idx"]), "success": bool(row["success"]),
+                  "success_final": success_final, "length": T,
                   "success_step": int(row["success_step"]) if row["success"] else None, "grasp_step": grasp,
                   "mean": float(df.value_mean.mean()), "final": float(df.value_mean.iloc[-1])}
         parts = cache_paths(name)["parts"]
@@ -74,7 +79,7 @@ def _process_episode(row: dict, metric_names: list[str]):
     return ep.load_s
 
 
-def _finalize(name: str, index: pd.DataFrame, run_name: str):
+def _finalize(name: str, index: pd.DataFrame):
     p = cache_paths(name)
     m = metrics.get(name)
     stems = [p["parts"] / _part_name(r) for r in index.to_dict("records")]
@@ -82,14 +87,18 @@ def _finalize(name: str, index: pd.DataFrame, run_name: str):
     eps = pd.DataFrame([json.loads(s.with_suffix(".json").read_text()) for s in stems])
     for col in ("success_step", "grasp_step"):
         eps[col] = eps[col].astype("Int64")
-    samples = [np.load(s.with_suffix(".npy")) for s in stems if s.with_suffix(".npy").exists()]
+    # colormap scale from closed-loop episodes only, so it does not change when a replay run is added
+    # (dream drift is larger and saturates the scale, which is visible on purpose)
+    closed = [s for s, r in zip(stems, index.replay) if not r] or stems
+    samples = [np.load(s.with_suffix(".npy")) for s in closed if s.with_suffix(".npy").exists()]
     if samples:
         allv = np.concatenate(samples)
         p1, p99 = (float(x) for x in np.percentile(allv, [1, 99]))
     else:
         p1 = p99 = None
     scale = {"metric": name, "kind": m.kind, "lower_is_better": m.lower_is_better, "p1": p1, "p99": p99,
-             "run": run_name, "n_episodes": len(eps), "n_frames": len(frames),
+             "runs": sorted(index.run.unique()), "scale_from": "closed-loop episodes",
+             "n_episodes": len(eps), "n_frames": len(frames),
              "views": {f"view{i}": v for i, v in enumerate(config.VIEWS)}}
     _write_atomic(p["frames"], lambda q: frames.to_parquet(q, index=False))
     _write_atomic(p["episodes"], lambda q: eps.to_parquet(q, index=False))
@@ -101,13 +110,20 @@ def _finalize(name: str, index: pd.DataFrame, run_name: str):
           f"scale p1={p1} p99={p99}")
 
 
+def _cache_matches(name: str, index: pd.DataFrame) -> bool:
+    eps = pd.read_parquet(cache_paths(name)["episodes"])
+    if "replay" not in eps:
+        return not index.replay.any()
+    key = ["task", "state", "rollout", "episode"]
+    return sorted(map(tuple, eps[key].to_numpy().tolist())) == sorted(map(tuple, index[key].to_numpy().tolist()))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--metric", action="append", default=[], help="metric name (repeatable)")
     ap.add_argument("--all", action="store_true", help="all registered metrics")
     ap.add_argument("--force", action="store_true", help="recompute even if the cache exists")
     ap.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
-    ap.add_argument("--run", default=config.DEFAULT_RUN, help="run name (must be in the allowlist)")
     ap.add_argument("--list", action="store_true", help="list registered metrics and exit")
     args = ap.parse_args(argv)
 
@@ -121,7 +137,7 @@ def main(argv=None):
     for n in names:
         metrics.get(n)
 
-    index = data.build_index(args.run)  # raises for held-out / non-allowlisted runs
+    index = data.build_full_index()  # raises for held-out / non-allowlisted runs
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if config.RUNS_ROOT.resolve() in config.CACHE_DIR.resolve().parents:
         sys.exit("refusing: cache dir is inside the runs directory")
@@ -130,8 +146,10 @@ def main(argv=None):
     for n in names:
         p = cache_paths(n)
         if p["frames"].exists() and not args.force:
-            print(f"[{n}] cache exists, skipping (use --force to recompute)")
-            continue
+            if _cache_matches(n, index):
+                print(f"[{n}] cache exists, skipping (use --force to recompute)")
+                continue
+            print(f"[{n}] cache does not match the episode index (new run?), recomputing")
         if args.force and p["parts"].exists():
             shutil.rmtree(p["parts"])
         p["parts"].mkdir(parents=True, exist_ok=True)
@@ -153,7 +171,7 @@ def main(argv=None):
             for f in tqdm(as_completed(futs), total=len(futs), unit="ep"):
                 f.result()
     for n in todo_metrics:
-        _finalize(n, index, args.run)
+        _finalize(n, index)
     return 0
 
 

@@ -1,9 +1,11 @@
 """Episode index, episode loading and the in-memory group store used by the viewer.
 
-There are no videos in the run: each episode stores real (`sim`) and imagined (`pred`) frames
+There are no videos in the runs: each episode stores real (`sim`) and imagined (`pred`) frames
 as (T,256,256,3) uint8 arrays in a compressed epNNN_success_*_frames.npz, one frame per env
 step, with the 3 views tiled into a 2x2 mosaic (see config.VIEW_SLICES). Loading = decompress
-both arrays once (sequential, no seeking) and cut out the views.
+both arrays once (sequential, no seeking) and cut out the views. In open-loop replay episodes
+`pred` is the dream (the model only saw the real observation at query 0) and `sim` is the
+simulator executing the dreamed actions.
 """
 import glob
 import json
@@ -22,19 +24,21 @@ from . import config, events
 from .metrics import apply_metric, get as get_metric
 
 META_KEYS = ("task", "episode", "initial_state_id", "rollout_idx", "policy_seed", "success",
-             "success_step", "episode_length", "instruction")
+             "success_step", "episode_length", "instruction", "open_loop")
 
 
 @lru_cache(maxsize=4)
 def build_index(run_name: str = config.DEFAULT_RUN) -> pd.DataFrame:
-    """One row per episode, built from the *_meta.json files (read-only)."""
+    """One row per episode of one run, built from the *_meta.json files (read-only)."""
     rd = config.run_dir(run_name)
     rows = []
     for path in sorted(glob.glob(str(rd / config.MODEL_DIR / "*" / "ep*_meta.json"))):
         with open(path) as f:
             meta = json.load(f)
         row = {k: meta.get(k) for k in META_KEYS}
+        row["open_loop"] = row["open_loop"] or "off"  # older closed-loop runs don't have the key
         row["stem"] = path[: -len("_meta.json")]
+        row["run"] = run_name
         rows.append(row)
     if not rows:
         raise FileNotFoundError(f"no episodes found under {rd}")
@@ -42,6 +46,42 @@ def build_index(run_name: str = config.DEFAULT_RUN) -> pd.DataFrame:
                                             "episode_length": "length"})
     df["success"] = df["success"].astype(bool)
     return df.sort_values(["task", "state", "rollout"]).reset_index(drop=True)
+
+
+@lru_cache(maxsize=1)
+def build_full_index() -> pd.DataFrame:
+    """Dev run plus the replay run (if any), merged into the same (task, state) groups.
+
+    Columns added: replay (bool), twin (rollout id of the closed-loop twin, replay rows only).
+    Replay rollout r gets the rollout id REPLAY_ROLLOUT_OFFSET + r so it sits next to closed-loop
+    rollout r; the original rollout_idx is kept in rollout_idx. A replay episode must have a
+    closed-loop twin in the dev run on (task, initial state, policy seed), otherwise it is refused
+    (so states that are not in the dev run, e.g. held-out ones, can never come in this way).
+    """
+    dev = build_index(config.DEFAULT_RUN).assign(replay=False, rollout_idx=lambda d: d.rollout, twin=pd.NA)
+    name = config.replay_run_name()
+    if name is None:
+        return dev
+    rep = build_index(name)
+    bad = rep[rep.open_loop != "replay"]
+    if len(bad):
+        raise ValueError(f"{name}: {len(bad)} episodes are not open_loop=replay, e.g. {bad.stem.iloc[0]}")
+    twins = dev.set_index(["task", "state", "policy_seed"]).rollout
+    keys = list(zip(rep.task, rep.state, rep.policy_seed))
+    missing = [k for k in keys if k not in twins.index]
+    if missing:
+        raise config.ForbiddenRunError(f"{name}: {len(missing)} replay episodes have no closed-loop twin in "
+                                       f"{config.DEFAULT_RUN}, e.g. {missing[0]}")
+    rep = rep.assign(replay=True, rollout_idx=rep.rollout, twin=[int(twins.loc[k]) for k in keys],
+                     rollout=rep.rollout + config.REPLAY_ROLLOUT_OFFSET)
+    print(f"[index] {len(dev)} closed-loop episodes ({config.DEFAULT_RUN}) + {len(rep)} replay episodes ({name})",
+          flush=True)
+    return pd.concat([dev, rep], ignore_index=True).sort_values(["task", "state", "rollout"]).reset_index(drop=True)
+
+
+def rollout_label(rollout: int, replay: bool) -> str:
+    """Display name: r3 for closed loop, r0 dream for the open-loop replay of rollout 0."""
+    return f"r{int(rollout) - config.REPLAY_ROLLOUT_OFFSET} dream" if replay else f"r{int(rollout)}"
 
 
 @dataclass
