@@ -23,7 +23,7 @@ body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0;
 .controls button:hover { background: #eef; }
 .counter { font-family: ui-monospace, monospace; font-size: 13px; margin-left: 8px; }
 .panel-c-top { display: flex; gap: 40px; align-items: flex-start; flex-wrap: wrap; }
-.rollout-list { width: 390px; flex: none; }
+.rollout-list { width: 470px; flex: none; }
 .rollout-list .dash-spreadsheet td { cursor: pointer; }
 .cutoff-row { display: flex; align-items: center; gap: 10px; margin: 2px 0 6px; }
 .cutoff-slider { flex: 1; }
@@ -31,3 +31,11 @@ body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0;
 .loop-badge:empty { display: none; }
 .loop-badge.closed { background: #eef1f5; color: #334; }
 .loop-badge.dream { background: #efe6f7; color: #5b2a86; border: 1px solid #5b2a86; font-weight: 600; }
+.ann { margin-top: 10px; padding: 8px; border: 1px solid #dde1e6; border-radius: 6px; background: #fafbfc; }
+.ann-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.star-btn { font-size: 20px; line-height: 1; width: 34px; height: 30px; border: 1px solid #bbb; background: #fff;
+            border-radius: 4px; cursor: pointer; color: #999; }
+.star-btn.on { color: #e8a400; border-color: #e8a400; background: #fff8e1; }
+.ann-status { margin-left: auto; }
+.note { width: 100%; min-height: 54px; box-sizing: border-box; font-family: system-ui; font-size: 13px; resize: vertical; }
+.note-save { margin: 4px 8px 0 0; height: 26px; border: 1px solid #bbb; background: #fff; border-radius: 4px; cursor: pointer; }

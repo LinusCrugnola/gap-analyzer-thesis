@@ -24,6 +24,8 @@ REPLAY_ROLLOUT_OFFSET = 100  # replay rollout r is shown as rollout id 100 + r, 
 MODEL_DIR = "base"  # run_dir/<model>/<task>/epNNN_success_*_{frames,traj}.npz, *_meta.json
 
 CACHE_DIR = Path(os.environ.get("GAP_ANALYZER_CACHE", APP_ROOT / "cache"))
+# Star ratings and notes per episode (user data: kept outside the cache and the run directories)
+ANNOTATIONS_FILE = Path(os.environ.get("GAP_ANALYZER_ANNOTATIONS", APP_ROOT / "annotations" / "annotations.json"))
 
 # Each stored frame is a 256x256 mosaic of 128x128 tiles: TL=left, TR=right, BL=wrist, BR=empty.
 # (verified against the per-view MSE logged in meta.json "step_errors")

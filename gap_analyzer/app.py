@@ -24,17 +24,24 @@ from dash import ALL, Dash, Input, Output, State, ctx, dash_table, dcc, html, no
 from dash.dash_table.Format import Format, Scheme
 from flask import Response, abort
 
-from . import config, data, render
+from . import annotations, config, data, render
 from .compute import cache_paths
 from .metrics import REGISTRY
 
 GREEN, RED, GREY = "#1a9850", "#d73027", "#b0b4ba"
 DREAM = "#5b2a86"  # open-loop dream label colour
+STAR = "#e8a400"
 ROW_BG = {"mixed": "#d9f0d3", "success": "#dcf1d8", "failure": "#f9dcd8",
           "success_sel": "#9fd59a", "failure_sel": "#f0a59b", "selected": "#dbe7ff"}
 
 INDEX = data.build_full_index()  # raises for held-out / non-allowlisted runs
 STORE = data.GroupStore(INDEX)
+ROWS = {(r["task"], int(r["state"]), int(r["rollout"])): r for r in INDEX.to_dict("records")}
+
+
+def ann_of(task: str, state: int, rollout: int) -> dict:
+    """Star and note of one rollout (see annotations.py)."""
+    return annotations.get(annotations.episode_key(ROWS[(task, int(state), int(rollout))]))
 FRAME_TIMES = deque(maxlen=200)  # server time per /frame request (ms), excluding first loads
 
 
@@ -83,6 +90,7 @@ def group_table(metric: str, tasks) -> list[dict]:
         rows.append({"id": f"{task}|{state}", "task": task, "state": int(state),
                      "success": f"{int(g.success.sum())}/{len(g)}", "mixed": int(lo <= rate <= hi),
                      "replay": f"{int(gr.success.sum())}/{len(gr)}" if len(gr) else "",
+                     "starred": sum(ann_of(task, state, r)["starred"] for r in ga.rollout) or None,
                      "mean": g["mean"].mean(),
                      "final": g["final"].mean(), "rank": rank, "spread": g["mean"].std()})
     return rows
@@ -138,8 +146,9 @@ def group_figure(metric: str, task: str, state: int, xmode: str, selected, cutof
         sel = selected is not None and int(selected) == int(r)
         label = data.rollout_label(r, e.replay)
         kind = "open-loop dream, replay " if e.replay else ""
+        star = " ★" if ann_of(task, state, r)["starred"] else ""
         fig.add_trace(go.Scattergl(
-            x=g[xcol], y=g.value_mean, mode="lines", name=f"{label} {'✓' if e.success else '✗'}",
+            x=g[xcol], y=g.value_mean, mode="lines", name=f"{label} {'✓' if e.success else '✗'}{star}",
             line=dict(color=color, width=3.5 if sel else 1.6, dash="dot" if e.replay else "solid"),
             opacity=1 if sel or selected is None else 0.55,
             customdata=np.full(len(g), r), legendgroup=str(r),
@@ -233,7 +242,9 @@ def rollout_rows(metric: str, task: str, state: int, cutoff: int | None = None) 
         fr = fr[fr.step <= cutoff]
     stats = fr.groupby("rollout").value_mean.agg(["mean", "max", "size"])
     g = eps[(eps.task == task) & (eps.state == state)].sort_values("rollout")
+    ann = {int(r): ann_of(task, state, r) for r in g.rollout}
     return [{"id": int(r.rollout), "rollout": data.rollout_label(r.rollout, r.replay), "success": int(r.success),
+             "star": "★" if ann[r.rollout]["starred"] else "", "note": ann[r.rollout]["note"],
              "replay": int(r.replay), "loop": "open (dream)" if r.replay else "closed",
              "steps": int(stats.loc[r.rollout, "size"]),
              "mean": float(stats.loc[r.rollout, "mean"]), "max": float(stats.loc[r.rollout, "max"])}
@@ -269,6 +280,7 @@ def serve_layout():
         {"name": "task", "id": "task"}, {"name": "state", "id": "state", "type": "numeric"},
         {"name": "success", "id": "success"},
         *([{"name": "replay success", "id": "replay"}] if INDEX.replay.any() else []),
+        {"name": "★", "id": "starred", "type": "numeric"},
         {"name": "mean", "id": "mean", "type": "numeric", "format": fmt},
         {"name": "final", "id": "final", "type": "numeric", "format": fmt},
         {"name": "within-group rank", "id": "rank", "type": "numeric", "format": fmt},
@@ -340,19 +352,38 @@ def serve_layout():
                     html.Div(id="rollouts-hint", className="hint"),
                     dash_table.DataTable(
                         id="rollouts", data=[], sort_action="native", sort_by=ROLLOUT_SORT_DEFAULT,
-                        columns=[{"name": "rollout", "id": "rollout"},
+                        columns=[{"name": "★", "id": "star"},
+                                 {"name": "rollout", "id": "rollout"},
                                  {"name": "loop", "id": "loop"},
                                  {"name": "steps", "id": "steps", "type": "numeric"},
                                  {"name": "avg", "id": "mean", "type": "numeric",
                                   "format": Format(precision=2, scheme=Scheme.fixed)},
                                  {"name": "max", "id": "max", "type": "numeric",
-                                  "format": Format(precision=2, scheme=Scheme.fixed)}],
+                                  "format": Format(precision=2, scheme=Scheme.fixed)},
+                                 {"name": "note", "id": "note"}],
+                        tooltip_delay=300, tooltip_duration=None,
                         style_cell={"fontSize": 13, "padding": "4px 8px", "fontFamily": "system-ui"},
                         style_header={"fontWeight": 600, "backgroundColor": "#f0f2f5"},
-                        style_cell_conditional=[{"if": {"column_id": c}, "textAlign": "left"}
-                                                for c in ("rollout", "loop")]),
+                        style_cell_conditional=[
+                            *[{"if": {"column_id": c}, "textAlign": "left"} for c in ("rollout", "loop")],
+                            {"if": {"column_id": "star"}, "textAlign": "center", "color": STAR, "width": "22px"},
+                            {"if": {"column_id": "note"}, "textAlign": "left", "maxWidth": "110px",
+                             "overflow": "hidden", "textOverflow": "ellipsis"}]),
                     html.Div(className="hint", style={"marginTop": 4},
-                             children="green = success, red = failure (for dream rows: replay success)."),
+                             children="green = success, red = failure (for dream rows: replay success). "
+                                      "★ = starred. Hover a note to read it."),
+                    html.Div(className="ann", children=[
+                        html.Div(className="ann-head", children=[
+                            html.Button("☆", id="star-btn", className="star-btn", n_clicks=0,
+                                        title="star / unstar this rollout (marks it as interesting)"),
+                            html.Span(id="ann-title", className="hint"),
+                            html.Span(id="ann-status", className="hint ann-status"),
+                        ]),
+                        dcc.Textarea(id="note", className="note", placeholder="note on this rollout…",
+                                     value="", disabled=True),
+                        html.Button("save note", id="note-save", n_clicks=0, className="note-save"),
+                        html.Span("(also saved when you click outside the box)", className="hint"),
+                    ]),
                 ]),
                 html.Div(children=[
                     html.Div(className="col-labels", children=[html.Div(v) for v in config.VIEWS]),
@@ -386,6 +417,7 @@ def serve_layout():
             ]),
             html.Div(id="step-time", className="status", style={"marginTop": 6}),
         ]),
+        dcc.Store(id="ann-key"), dcc.Store(id="ann-version", data=0),
         dcc.Store(id="sel-group"), dcc.Store(id="rollout"), dcc.Store(id="ep-info"), dcc.Store(id="play", data={"playing": False}),
         dcc.Interval(id="play-tick", interval=1000 // config.DEFAULT_FPS, disabled=True),
         dcc.Interval(id="status-tick", interval=1000),
@@ -423,8 +455,9 @@ def frame_jpeg(metric, task, state, rollout, i):
 
 # ---------------------------------------------------------------- callbacks
 
-@app.callback(Output("groups", "data"), Input("metric", "value"), Input("tasks", "value"))
-def update_table(metric, tasks):
+@app.callback(Output("groups", "data"), Input("metric", "value"), Input("tasks", "value"),
+              Input("ann-version", "data"))
+def update_table(metric, tasks, _ann_version):
     if not metric:
         return []
     return group_table(metric, tasks)
@@ -442,8 +475,8 @@ def select_group(cell):
 @app.callback(Output("group-plot", "figure"), Output("group-info", "children"),
               Output("cutoff", "max"), Output("cutoff", "value"), Output("cutoff", "disabled"),
               Input("sel-group", "data"), Input("metric", "value"), Input("xmode", "value"),
-              Input("rollout", "data"), State("cutoff", "value"))
-def update_group_plot(sel, metric, xmode, ro, cutoff):
+              Input("rollout", "data"), Input("ann-version", "data"), State("cutoff", "value"))
+def update_group_plot(sel, metric, xmode, ro, _ann_version, cutoff):
     if not sel or not metric:
         return no_update, "", no_update, no_update, no_update
     rollout = ro["rollout"] if ro and (ro["task"], ro["state"]) == (sel["task"], sel["state"]) else None
@@ -459,9 +492,9 @@ def update_group_plot(sel, metric, xmode, ro, cutoff):
 @app.callback(Output("rollouts", "data"), Output("rollouts", "sort_by"), Output("rollout", "data"),
               Output("rollouts-hint", "children"),
               Input("sel-group", "data"), Input("metric", "value"), Input("group-plot", "clickData"),
-              Input("rollouts", "active_cell"), Input("cutoff", "value"), State("cutoff", "max"),
-              State("rollout", "data"), prevent_initial_call=True)
-def select_rollout(sel, metric, click, cell, cutoff, cutoff_max, current):
+              Input("rollouts", "active_cell"), Input("cutoff", "value"), Input("ann-version", "data"),
+              State("cutoff", "max"), State("rollout", "data"), prevent_initial_call=True)
+def select_rollout(sel, metric, click, cell, cutoff, _ann_version, cutoff_max, current):
     """Rollout list of the group; on a new group sort by mean and select the lowest-mean rollout."""
     if not sel or not metric:
         return [], no_update, None, ""
@@ -487,7 +520,7 @@ def select_rollout(sel, metric, click, cell, cutoff, cutoff_max, current):
     if trig <= {"group-plot.clickData", "rollouts.active_cell"}:
         # selection only (active_cell is also cleared by sorting and by highlight_rollout: then nothing)
         return no_update, no_update, selection, no_update
-    return rows, no_update, selection, hint  # metric / cursor: new numbers, keep selection and sort order
+    return rows, no_update, selection, hint  # metric / cursor / annotations: new rows, keep selection and sort
 
 
 @app.callback(Output("rollouts", "style_data_conditional"), Output("rollouts", "active_cell"),
@@ -520,6 +553,51 @@ def update_episode(ro, metric, frame, prev_info):
     fig.layout.shapes[0].update(x0=info["steps"][frame], x1=info["steps"][frame])
     return (fig, info, info["n"] - 1, frame, labels, {"playing": False}, *loop_badge(ro, info),
             "dream (open loop)" if info["replay"] else "imagined")
+
+
+@app.callback(Output("rollouts", "tooltip_data"), Input("rollouts", "data"))
+def note_tooltips(rows):
+    return [{"note": {"value": r["note"], "type": "text"}} if r.get("note") else {} for r in rows or []]
+
+
+@app.callback(Output("ann-version", "data"), Output("ann-status", "children"),
+              Input("star-btn", "n_clicks"), Input("note-save", "n_clicks"), Input("note", "n_blur"),
+              State("note", "value"), State("ann-key", "data"), State("ann-version", "data"),
+              prevent_initial_call=True)
+def save_annotation(_star, _save, _blur, note, key, version):
+    """Star toggle / note save for the rollout the editor shows (ann-key, set by load_annotation).
+    Kept separate from load_annotation: a save refreshes the rollout list, which can change the
+    selection, and Dash does not re-run a callback that is already upstream in the same chain."""
+    if not key:
+        return no_update, no_update
+    row = ROWS[(key["task"], key["state"], key["rollout"])]
+    k = annotations.episode_key(row)
+    cur = annotations.get(k)
+    trig = set(ctx.triggered_prop_ids)
+    label = data.rollout_label(key["rollout"], row["replay"])
+    if "star-btn.n_clicks" in trig:
+        annotations.set_(k, row, starred=not cur["starred"])
+        return (version or 0) + 1, f"{label} {'unstarred' if cur['starred'] else 'starred'}"
+    if (note or "").strip() != cur["note"]:
+        annotations.set_(k, row, note=note or "")
+        return (version or 0) + 1, f"{label}: note saved {time.strftime('%H:%M:%S')}"
+    return no_update, no_update
+
+
+@app.callback(Output("star-btn", "children"), Output("star-btn", "className"), Output("note", "value"),
+              Output("note", "disabled"), Output("ann-title", "children"), Output("ann-key", "data"),
+              Input("rollout", "data"), Input("ann-version", "data"))
+def load_annotation(ro, _version):
+    """Show the star and note of the selected rollout; the note box is only reset on a new rollout
+    (so typing is not overwritten when another annotation is saved)."""
+    if not ro:
+        return "☆", "star-btn", "", True, "", None
+    key = {"task": ro["task"], "state": int(ro["state"]), "rollout": int(ro["rollout"])}
+    a = ann_of(key["task"], key["state"], key["rollout"])
+    new = "rollout.data" in ctx.triggered_prop_ids
+    return ("★" if a["starred"] else "☆", "star-btn on" if a["starred"] else "star-btn",
+            a["note"] if new else no_update, False,
+            data.rollout_label(key["rollout"], ROWS[(key["task"], key["state"], key["rollout"])]["replay"]), key)
 
 
 @app.callback(Output("status", "children"), Input("status-tick", "n_intervals"))

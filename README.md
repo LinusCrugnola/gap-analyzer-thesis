@@ -10,7 +10,8 @@ run (plus run names matching the replay pattern), and any path containing "heldo
 (also after resolving symlinks). Every replay episode must have a closed-loop twin in the dev run
 on (task, initial state, policy seed), otherwise the index refuses the run, so no state outside
 the dev run can come in through a replay run.
-Nothing is written into the run directory or the DeVA repo. The only output goes to `cache/`.
+Nothing is written into the run directory or the DeVA repo. The only output goes to `cache/` and
+to `annotations/annotations.json` (your stars and notes, see "Stars and notes").
 No DeVA code is imported.
 
 ## Setup (once)
@@ -91,6 +92,28 @@ run (estimated from 100k random samples per episode), used as the fixed colormap
 
 Error maps are never written to disk. They are recomputed in RAM when a group is opened.
 
+## Stars and notes
+
+Under the rollout list in panel C you can star the shown rollout (☆/★, marks it as interesting)
+and write a note. The note is saved when you click outside the box or press "save note". Stars
+and notes show in the rollout list (★ column, note column, hover a note to read all of it), in the
+panel B legend ("r3 ✓ ★") and as a count per group in panel A (★ column).
+
+They are stored in `annotations/annotations.json` in the app folder (override with
+`GAP_ANALYZER_ANNOTATIONS=/path/file.json`), one entry per episode, keyed by
+`<run>/<task>/epNNN`, with task, state, rollout, replay and the time of the last change:
+
+```json
+{"20261027_1743_gap_dev_h16/CoffeeSetupMug/ep075":
+   {"starred": true, "note": "gripper slips at step 200", "task": "CoffeeSetupMug", "state": 41,
+    "rollout": 3, "replay": false, "updated": "2026-10-29 18:51:00"}}
+```
+
+The file is not in the cache, so recomputing metrics keeps it. An episode with no star and an
+empty note is removed from the file. The app reads the file at start: if you edit it by hand,
+restart the app. When syncing code to labu, don't overwrite or delete `annotations/`
+(e.g. `rsync --exclude annotations`).
+
 ## Adding a metric
 
 Add a decorated function to any module in `gap_analyzer/metrics/` (new modules are imported
@@ -168,6 +191,7 @@ gap_analyzer/config.py         paths, allowlist + heldout check, defaults
 gap_analyzer/data.py           episode index (meta.json, dev + replay with twin check), npz loading, GroupStore
 gap_analyzer/events.py         chunk boundaries, success step, grasp step
 gap_analyzer/metrics/          registry (__init__), interfaces (base), pixel_mse / pixel_l1 (pixel)
+gap_analyzer/annotations.py    stars and notes per episode (annotations/annotations.json)
 gap_analyzer/compute.py        CLI: metric over all dev episodes -> parquet cache
 gap_analyzer/render.py         composite image (3x3 tiles, colormap) -> JPEG
 gap_analyzer/app.py            Dash app; frames are served at /frame/<metric>/<task>/<state>/<rollout>/<i>.jpg
